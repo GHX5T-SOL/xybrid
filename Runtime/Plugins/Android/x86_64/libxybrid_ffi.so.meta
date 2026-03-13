@@ -1,5 +1,5 @@
 fileFormatVersion: 2
-guid: 0000000000000000189c7565bc856941
+guid: e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6
 PluginImporter:
   externalObjects: {}
   serializedVersion: 3
@@ -23,13 +23,7 @@ PluginImporter:
     Android:
       enabled: 1
       settings:
-        CPU: ARM64
-    Editor:
-      enabled: 0
-      settings:
-        CPU: AnyCPU
-        DefaultValueInitialized: true
-        OS: AnyOS
+        CPU: x86_64
   userData:
   assetBundleName:
   assetBundleVariant:

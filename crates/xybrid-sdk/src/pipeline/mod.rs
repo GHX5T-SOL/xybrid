@@ -1362,6 +1362,7 @@ impl Xybrid {
                             EnvelopeKind::Text(_) => OutputType::Text,
                             EnvelopeKind::Audio(_) => OutputType::Audio,
                             EnvelopeKind::Embedding(_) => OutputType::Embedding,
+                            EnvelopeKind::TokenIds(_) => OutputType::Unknown,
                         };
 
                         return Ok(PipelineExecutionResult {

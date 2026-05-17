@@ -55,15 +55,21 @@ pub use config::{
 pub use result::{FfiPipelineExecutionResult, FfiStageExecutionResult};
 
 use crate::model::SdkError;
-use crate::registry_client::RegistryClient;
+use crate::registry_client::{
+    registry_format_for_auto_local_backend, registry_format_for_backend,
+    registry_format_preference_for_backend_override_with_registry_context, RegistryClient,
+    RegistryFormatPreference,
+};
 use crate::result::OutputType;
 use crate::run_options::RunOptions;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use xybrid_core::context::{DeviceMetrics, StageDescriptor};
 use xybrid_core::device::ResourceMonitor;
+use xybrid_core::execution::{ExecutionTemplate, ModelMetadata, PreprocessingStep};
 use xybrid_core::ir::{Envelope, EnvelopeKind};
 use xybrid_core::orchestrator::routing_engine::LocalAvailability;
 use xybrid_core::orchestrator::{
@@ -72,9 +78,128 @@ use xybrid_core::orchestrator::{
 };
 use xybrid_core::pipeline::{ExecutionTarget, IntegrationProvider, StageOptions};
 use xybrid_core::pipeline_config::PipelineConfig;
+use xybrid_core::runtime_adapter::{BackendChoice, SelectorCfg};
 
 /// Result type for pipeline operations.
 pub type PipelineResult<T> = Result<T, SdkError>;
+
+fn is_streaming_llm_metadata(metadata: &xybrid_core::execution::ModelMetadata) -> bool {
+    if matches!(
+        metadata.execution_template,
+        xybrid_core::execution::ExecutionTemplate::Gguf { .. }
+    ) {
+        return cfg!(any(feature = "llm-mistral", feature = "llm-llamacpp"));
+    }
+
+    let cfg = SelectorCfg::current();
+    is_streaming_mlx_metadata_with_cfg(metadata, &cfg)
+}
+
+fn is_streaming_mlx_metadata_with_cfg(
+    metadata: &xybrid_core::execution::ModelMetadata,
+    cfg: &SelectorCfg,
+) -> bool {
+    xybrid_core::execution::template::is_mlx_llm_safetensors_metadata(metadata)
+        && cfg.mlx_compiled
+        && cfg.host_is_apple_arm64
+        && cfg.mlx_runtime_ok
+}
+
+fn stage_registry_format(
+    client: &RegistryClient,
+    stage_config: &xybrid_core::pipeline_config::StageConfig,
+    cfg: &SelectorCfg,
+) -> PipelineResult<Option<&'static str>> {
+    let model_id = stage_config.model_id();
+
+    match registry_format_preference_for_backend_override_with_registry_context(
+        client,
+        &model_id,
+        stage_config.backend(),
+        cfg,
+    )? {
+        RegistryFormatPreference::Auto => {
+            registry_format_for_auto_local_backend(client, &model_id, cfg)
+        }
+        RegistryFormatPreference::ExplicitBackend { format } => Ok(format),
+    }
+}
+
+fn pipeline_input_type_from_metadata(metadata: &ModelMetadata) -> PipelineInputType {
+    for step in &metadata.preprocessing {
+        match step {
+            PreprocessingStep::AudioDecode { .. } | PreprocessingStep::MelSpectrogram { .. } => {
+                return PipelineInputType::Audio;
+            }
+            PreprocessingStep::Tokenize { .. }
+            | PreprocessingStep::PhonemeRaw { .. }
+            | PreprocessingStep::Phonemize { .. } => {
+                return PipelineInputType::Text;
+            }
+            PreprocessingStep::Reshape { .. } => return PipelineInputType::Embedding,
+            PreprocessingStep::Normalize { .. }
+            | PreprocessingStep::Resize { .. }
+            | PreprocessingStep::CenterCrop { .. } => {}
+        }
+    }
+
+    if let Some(task) = metadata.metadata.get("task").and_then(|v| v.as_str()) {
+        match xybrid_core::execution::template::stage_kind_from_task(task) {
+            Some("asr" | "audio") => return PipelineInputType::Audio,
+            Some("llm" | "tts" | "translate" | "embed") => return PipelineInputType::Text,
+            _ => {}
+        }
+    }
+
+    match &metadata.execution_template {
+        ExecutionTemplate::Gguf { .. } => PipelineInputType::Text,
+        ExecutionTemplate::SafeTensors { .. }
+            if xybrid_core::execution::template::is_mlx_llm_safetensors_metadata(metadata)
+                || xybrid_core::execution::template::is_mlx_embedding_safetensors_metadata(
+                    metadata,
+                ) =>
+        {
+            PipelineInputType::Text
+        }
+        _ => PipelineInputType::Unknown,
+    }
+}
+
+fn pipeline_input_type_from_model_dir(model_dir: &Path) -> Option<PipelineInputType> {
+    let metadata_path = model_dir.join("model_metadata.json");
+    let metadata = std::fs::read_to_string(metadata_path).ok()?;
+    let metadata = serde_json::from_str::<ModelMetadata>(&metadata).ok()?;
+    Some(pipeline_input_type_from_metadata(&metadata))
+}
+
+fn offline_model_dir_for_input_type(
+    client: &RegistryClient,
+    model_id: &str,
+    backend: Option<&str>,
+) -> Option<PathBuf> {
+    let mut formats = Vec::new();
+    if let Some(raw_backend) = backend {
+        if let Ok(Some(choice)) = BackendChoice::parse(raw_backend) {
+            if let Some(format) = registry_format_for_backend(choice) {
+                formats.push(format);
+            }
+        }
+    }
+
+    for format in ["safetensors", "gguf"] {
+        if !formats.contains(&format) {
+            formats.push(format);
+        }
+    }
+
+    for format in formats {
+        if let Some(model_dir) = client.resolve_offline_with_format(model_id, format) {
+            return Some(model_dir);
+        }
+    }
+
+    client.resolve_offline(model_id)
+}
 
 // ============================================================================
 // PipelineRef - Lightweight reference from YAML
@@ -168,6 +293,8 @@ pub struct StageInfo {
     pub status: StageStatus,
     /// Download size in bytes (if needs download)
     pub download_bytes: Option<u64>,
+    /// Explicit local generation or embedding backend override, when requested.
+    pub backend: Option<String>,
 }
 
 /// Execution target for a stage.
@@ -243,7 +370,6 @@ pub struct DownloadProgress {
 use xybrid_core::pipeline_config::StageConfig;
 
 /// Input type for pipeline (public API).
-/// This will be auto-inferred from model metadata in a future release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PipelineInputType {
     Audio,
@@ -310,6 +436,21 @@ impl PipelineExecutionResult {
 
 fn pipeline_metrics(options: &RunOptions) -> DeviceMetrics {
     options.device_metrics.as_ref().cloned().unwrap_or_default()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_millis_u32(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis_u64)
+        .unwrap_or(0)
 }
 
 fn pipeline_complete_data(
@@ -392,6 +533,10 @@ pub struct Pipeline {
 impl Pipeline {
     /// Create a Pipeline from a PipelineRef by resolving models.
     fn from_ref(ref_: &PipelineRef) -> PipelineResult<Self> {
+        Self::from_ref_with_selector_cfg(ref_, &SelectorCfg::current())
+    }
+
+    fn from_ref_with_selector_cfg(ref_: &PipelineRef, cfg: &SelectorCfg) -> PipelineResult<Self> {
         let config = ref_.config.clone();
 
         // Build stage descriptors (bundle_path will be set after downloading)
@@ -411,6 +556,10 @@ impl Pipeline {
                     if desc.target.is_none() {
                         desc.target = Some(ExecutionTarget::Cloud);
                     }
+                }
+
+                if let Some(backend) = stage_config.backend() {
+                    desc.backend = Some(backend.to_string());
                 }
 
                 // Use model_id() for descriptor's model field
@@ -441,7 +590,16 @@ impl Pipeline {
         if let Some(ref client) = client {
             for stage_config in &stage_configs {
                 let model_id = stage_config.model_id();
-                let is_cached = client.is_cached(&model_id, None).unwrap_or(false);
+                let format = stage_registry_format(client, stage_config, cfg)
+                    .ok()
+                    .flatten();
+                let is_cached = if let Some(format) = format {
+                    client
+                        .is_cached_with_format(&model_id, None, format)
+                        .unwrap_or(false)
+                } else {
+                    client.is_cached(&model_id, None).unwrap_or(false)
+                };
                 availability_map.insert(model_id, is_cached);
             }
         }
@@ -457,7 +615,7 @@ impl Pipeline {
         let handle = Arc::new(RwLock::new(handle));
 
         // Resolve stages and compute download info
-        let (stages, total_download_bytes) = Self::resolve_stages(&handle, &config)?;
+        let (stages, total_download_bytes) = Self::resolve_stages(&handle, &config, cfg)?;
 
         Ok(Self {
             name: config.name,
@@ -516,6 +674,7 @@ impl Pipeline {
     fn resolve_stages(
         handle: &Arc<RwLock<PipelineHandle>>,
         config: &PipelineConfig,
+        cfg: &SelectorCfg,
     ) -> PipelineResult<(Vec<StageInfo>, u64)> {
         let registry_url = config.registry.clone();
 
@@ -537,6 +696,7 @@ impl Pipeline {
             let target_str = stage_config.target();
             let provider = stage_config.provider();
             let model_name = Some(stage_config.model_id());
+            let backend = stage_config.backend().map(String::from);
 
             let stage_target = if provider.is_some() || target_str == Some("integration") {
                 StageTarget::Integration {
@@ -557,9 +717,21 @@ impl Pipeline {
                 if matches!(stage_target, StageTarget::Device | StageTarget::Auto) {
                     // For device/auto stages, check if model is cached (might run locally)
                     let model_id = stage_config.model_id();
-                    match client.resolve(&model_id, None) {
+                    let format = stage_registry_format(&client, stage_config, cfg)?;
+                    let resolved = if let Some(format) = format {
+                        client.resolve_with_format(&model_id, None, format)
+                    } else {
+                        client.resolve(&model_id, None)
+                    };
+                    match resolved {
                         Ok(resolved) => {
-                            let is_cached = client.is_cached(&model_id, None).unwrap_or(false);
+                            let is_cached = if let Some(format) = format {
+                                client
+                                    .is_cached_with_format(&model_id, None, format)
+                                    .unwrap_or(false)
+                            } else {
+                                client.is_cached(&model_id, None).unwrap_or(false)
+                            };
                             if is_cached {
                                 (StageStatus::Cached, None)
                             } else {
@@ -591,6 +763,7 @@ impl Pipeline {
                 target: stage_target,
                 status,
                 download_bytes,
+                backend,
             });
         }
 
@@ -618,11 +791,61 @@ impl Pipeline {
     }
 
     /// Get the expected input type for this pipeline.
-    ///
-    /// Note: In a future release, this will be auto-inferred from the first stage's
-    /// model metadata preprocessing steps.
     pub fn input_type(&self) -> PipelineInputType {
-        // TODO: Auto-infer from first stage's model_metadata.json preprocessing
+        let Some(first_stage) = self.stages.first() else {
+            return PipelineInputType::Unknown;
+        };
+
+        let (bundle_path, stage_config, registry_url) = {
+            let Ok(handle) = self.handle.read() else {
+                return PipelineInputType::Unknown;
+            };
+            let bundle_path = handle
+                .bundle_paths
+                .get(&first_stage.id)
+                .or_else(|| {
+                    first_stage
+                        .model_id
+                        .as_ref()
+                        .and_then(|model_id| handle.bundle_paths.get(model_id))
+                })
+                .cloned();
+            let stage_config = handle.stage_configs.first().cloned();
+            let registry_url = handle.registry_url.clone();
+            (bundle_path, stage_config, registry_url)
+        };
+
+        if let Some(bundle_path) = bundle_path {
+            if let Some(input_type) = pipeline_input_type_from_model_dir(&bundle_path) {
+                return input_type;
+            }
+        }
+
+        let Some(stage_config) = stage_config else {
+            return PipelineInputType::Unknown;
+        };
+        if stage_config.is_cloud_stage() {
+            return PipelineInputType::Unknown;
+        }
+
+        let client = match registry_url {
+            Some(url) => RegistryClient::with_url(url),
+            None => RegistryClient::from_env(),
+        };
+        let Ok(client) = client else {
+            return PipelineInputType::Unknown;
+        };
+
+        if let Some(model_dir) = offline_model_dir_for_input_type(
+            &client,
+            &stage_config.model_id(),
+            stage_config.backend(),
+        ) {
+            if let Some(input_type) = pipeline_input_type_from_model_dir(&model_dir) {
+                return input_type;
+            }
+        }
+
         PipelineInputType::Unknown
     }
 
@@ -699,28 +922,41 @@ impl Pipeline {
         // Get current device metrics for routing decisions
         let metrics = DeviceMetrics::default();
 
-        let stages_to_fetch: Vec<_> = self
+        let stage_configs = self
+            .handle
+            .read()
+            .map_err(|_| SdkError::PipelineError("Failed to read handle".to_string()))?
+            .stage_configs
+            .clone();
+        let selector_cfg = SelectorCfg::current();
+        let mut stages_to_fetch = Vec::new();
+        for (idx, stage) in self
             .stages
             .iter()
             .enumerate()
             .filter(|(_, s)| matches!(s.status, StageStatus::NeedsDownload))
-            .filter_map(|(idx, s)| {
-                s.model_id.as_ref().map(|m| {
-                    (
-                        idx,
-                        s.id.clone(),
-                        m.clone(),
-                        s.download_bytes.unwrap_or(0),
-                        s.target.clone(),
-                    )
-                })
-            })
-            .collect();
+        {
+            let Some(model_id) = stage.model_id.as_ref() else {
+                continue;
+            };
+            let Some(stage_config) = stage_configs.get(idx) else {
+                continue;
+            };
+            let format = stage_registry_format(&client, stage_config, &selector_cfg)?;
+            stages_to_fetch.push((
+                idx,
+                stage.id.clone(),
+                model_id.clone(),
+                stage.download_bytes.unwrap_or(0),
+                stage.target.clone(),
+                format,
+            ));
+        }
 
         let total_stages = stages_to_fetch.len();
         let mut skipped_count = 0;
 
-        for (stage_idx, (_, stage_id, model_id, total_bytes, stage_target)) in
+        for (stage_idx, (_, stage_id, model_id, total_bytes, stage_target, stage_format)) in
             stages_to_fetch.into_iter().enumerate()
         {
             // Convert StageTarget to ExecutionTarget for authority
@@ -764,7 +1000,16 @@ impl Pipeline {
 
                     // Fetch model and extract to permanent cache directory
                     // Uses CacheManager.ensure_extracted() as single source of truth
-                    let model_dir = client.fetch_extracted(&model_id, None, progress_for_model)?;
+                    let model_dir = if let Some(format) = stage_format {
+                        client.fetch_extracted_with_format(
+                            &model_id,
+                            None,
+                            format,
+                            progress_for_model,
+                        )?
+                    } else {
+                        client.fetch_extracted(&model_id, None, progress_for_model)?
+                    };
 
                     {
                         // Recover from poisoned RwLock to prevent permanent lock errors
@@ -977,7 +1222,7 @@ impl Pipeline {
         })?;
         let results: Vec<StageExecutionResult> = execution_result
             .map_err(|e| SdkError::PipelineError(format!("Pipeline execution failed: {}", e)))?;
-        let total_latency_ms = start_time.elapsed().as_millis() as u32;
+        let total_latency_ms = duration_millis_u32(start_time.elapsed());
 
         let stages: Vec<StageTiming> = results
             .iter()
@@ -1037,10 +1282,7 @@ impl Pipeline {
                 &output_type,
                 options.correlation_id.as_deref(),
             )),
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            timestamp_ms: current_timestamp_millis(),
         };
         crate::telemetry::publish_with_resource_summary_in_context(
             event,
@@ -1135,7 +1377,7 @@ impl Pipeline {
             let results: Vec<StageExecutionResult> = execution_result.map_err(|e| {
                 SdkError::PipelineError(format!("Pipeline execution failed: {}", e))
             })?;
-            let total_latency_ms = start_time.elapsed().as_millis() as u32;
+            let total_latency_ms = duration_millis_u32(start_time.elapsed());
 
             let stages: Vec<StageTiming> = results
                 .iter()
@@ -1190,10 +1432,7 @@ impl Pipeline {
                     &output_type,
                     options.correlation_id.as_deref(),
                 )),
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
+                timestamp_ms: current_timestamp_millis(),
             };
             crate::telemetry::publish_with_resource_summary_in_context(
                 event,
@@ -1235,6 +1474,14 @@ impl Clone for Pipeline {
 pub struct Xybrid;
 
 impl Xybrid {
+    /// Create a registry-backed model loader.
+    ///
+    /// This is equivalent to [`ModelLoader::from_registry`] and exists so
+    /// callers can fluently attach SDK-level options before loading.
+    pub fn model(id: &str) -> crate::model::ModelLoader {
+        crate::model::ModelLoader::from_registry(id)
+    }
+
     /// Run a pipeline from YAML in one call.
     ///
     /// This is the simplest way to run a pipeline - it handles everything:
@@ -1303,9 +1550,11 @@ impl Xybrid {
     ///
     /// # Note
     ///
-    /// Streaming is only supported for LLM stages (GGUF models). For other
-    /// model types, this behaves identically to `run_pipeline`.
-    #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
+    /// Streaming is only supported for runtime-ready LLM stages (GGUF with a
+    /// compiled GGUF backend, or MLX SafeTensors with the Apple Silicon macOS
+    /// MLX runtime available). For other model types, this behaves identically
+    /// to `run_pipeline`.
+    #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp", feature = "llm-mlx"))]
     pub fn run_pipeline_streaming<'a>(
         yaml: &str,
         envelope: &Envelope,
@@ -1337,16 +1586,24 @@ impl Xybrid {
                     let metadata_str = std::fs::read_to_string(&metadata_path).map_err(|e| {
                         SdkError::PipelineError(format!("Failed to read metadata: {}", e))
                     })?;
-                    let metadata: ModelMetadata =
+                    let mut metadata: ModelMetadata =
                         serde_json::from_str(&metadata_str).map_err(|e| {
                             SdkError::PipelineError(format!("Failed to parse metadata: {}", e))
                         })?;
+                    if let Some(backend) = handle.stage_descriptors[0].backend.as_deref() {
+                        let canonical = match crate::BackendChoice::parse(backend).map_err(|e| {
+                            SdkError::PipelineError(format!(
+                                "Invalid backend override for stage '{}': {}",
+                                stage_name, e
+                            ))
+                        })? {
+                            Some(choice) => choice.as_str(),
+                            None => "auto",
+                        };
+                        metadata.backend = Some(canonical.to_string());
+                    }
 
-                    // Check if this is an LLM model
-                    if matches!(
-                        metadata.execution_template,
-                        xybrid_core::execution::ExecutionTemplate::Gguf { .. }
-                    ) {
+                    if is_streaming_llm_metadata(&metadata) {
                         drop(handle); // Release lock before executor call
 
                         let mut executor =
@@ -1356,7 +1613,7 @@ impl Xybrid {
                         let output = executor
                             .execute_streaming(&metadata, envelope, on_token, None)
                             .map_err(|e| SdkError::InferenceError(format!("{}", e)))?;
-                        let total_latency_ms = start_time.elapsed().as_millis() as u32;
+                        let total_latency_ms = duration_millis_u32(start_time.elapsed());
 
                         let output_type = match &output.kind {
                             EnvelopeKind::Text(_) => OutputType::Text,
@@ -1391,7 +1648,7 @@ impl Xybrid {
     ///
     /// Without LLM features, streaming is not available and this falls back
     /// to regular pipeline execution.
-    #[cfg(not(any(feature = "llm-mistral", feature = "llm-llamacpp")))]
+    #[cfg(not(any(feature = "llm-mistral", feature = "llm-llamacpp", feature = "llm-mlx")))]
     #[allow(unused_variables)]
     pub fn run_pipeline_streaming<'a>(
         yaml: &str,
@@ -1410,6 +1667,55 @@ impl Xybrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_millis_conversions_saturate() {
+        assert_eq!(
+            duration_millis_u64(std::time::Duration::from_millis(42)),
+            42
+        );
+        assert_eq!(
+            duration_millis_u64(std::time::Duration::from_secs(u64::MAX)),
+            u64::MAX
+        );
+        assert_eq!(
+            duration_millis_u32(std::time::Duration::from_millis(u64::from(u32::MAX) + 1)),
+            u32::MAX
+        );
+    }
+
+    fn apple_mlx_selector_cfg() -> SelectorCfg {
+        SelectorCfg {
+            target: "macos-aarch64".to_string(),
+            host_is_apple_arm64: true,
+            mlx_compiled: true,
+            llamacpp_compiled: true,
+            mistral_compiled: false,
+            mlx_runtime_ok: true,
+        }
+    }
+
+    fn linux_llamacpp_selector_cfg() -> SelectorCfg {
+        SelectorCfg {
+            target: "linux-x86_64".to_string(),
+            host_is_apple_arm64: false,
+            mlx_compiled: false,
+            llamacpp_compiled: true,
+            mistral_compiled: false,
+            mlx_runtime_ok: false,
+        }
+    }
+
+    fn macos_all_backends_selector_cfg() -> SelectorCfg {
+        SelectorCfg {
+            target: "macos-aarch64".to_string(),
+            host_is_apple_arm64: true,
+            mlx_compiled: true,
+            llamacpp_compiled: true,
+            mistral_compiled: true,
+            mlx_runtime_ok: true,
+        }
+    }
 
     #[test]
     fn test_pipeline_ref_from_yaml() {
@@ -1463,6 +1769,363 @@ stages:
     fn xybrid_run_pipeline_with_options_is_public_api() {
         let _method: fn(&str, &Envelope, &RunOptions) -> PipelineResult<PipelineExecutionResult> =
             Xybrid::run_pipeline_with_options;
+    }
+
+    #[test]
+    fn xybrid_model_returns_registry_loader() {
+        let loader = Xybrid::model("qwen3.5-0.6b");
+
+        assert_eq!(loader.model_id(), Some("qwen3.5-0.6b"));
+        assert_eq!(loader.source_type(), "registry");
+    }
+
+    #[test]
+    fn pipeline_load_carries_stage_backend_override_to_descriptor() {
+        let yaml = r#"
+name: "Backend Override"
+stages:
+  - id: llm
+    model: qwen3.5-0.6b
+    target: cloud
+    backend: mlx
+"#;
+        let pipeline = PipelineRef::from_yaml(yaml).unwrap().load().unwrap();
+        let handle = pipeline.handle.read().unwrap();
+
+        assert_eq!(handle.stage_descriptors[0].backend.as_deref(), Some("mlx"));
+    }
+
+    #[test]
+    fn pipeline_stage_registry_format_rejects_unavailable_explicit_mlx() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+stages:
+  - model: qwen3-4b
+    backend: mlx
+"#,
+        )
+        .unwrap();
+        let client = RegistryClient::with_url("http://127.0.0.1:9").unwrap();
+
+        let err = stage_registry_format(&client, &config.stages[0], &linux_llamacpp_selector_cfg())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("MLX backend requested but not available"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_stage_registry_format_keeps_explicit_mistral_on_registry_default() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+stages:
+  - model: qwen3-4b
+    backend: mistral
+"#,
+        )
+        .unwrap();
+        let client = RegistryClient::with_url("http://127.0.0.1:9").unwrap();
+
+        let format = stage_registry_format(
+            &client,
+            &config.stages[0],
+            &macos_all_backends_selector_cfg(),
+        )
+        .unwrap();
+
+        assert_eq!(format, None);
+    }
+
+    #[test]
+    fn pipeline_stage_registry_format_rejects_llamacpp_for_embedding_task() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let model_id = format!("test-embed-{}", uuid::Uuid::new_v4());
+        let detail_body = format!(
+            r#"{{
+                "id":"{model_id}",
+                "family":"test",
+                "task":"text-embedding",
+                "parameters":1,
+                "description":"d",
+                "default_variant":null,
+                "variants":{{
+                    "llamacpp-q4":{{
+                        "platform":"macos-arm64",
+                        "format":"gguf",
+                        "quantization":"q4",
+                        "size_bytes":34,
+                        "hf_repo":"xybrid-ai/{model_id}",
+                        "file":"model.gguf"
+                    }}
+                }}
+            }}"#
+        );
+        let detail_mock = server.mock(|when, then| {
+            when.method(GET).path(format!("/v1/models/{model_id}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(detail_body);
+        });
+        let config = PipelineConfig::from_yaml(&format!(
+            r#"
+stages:
+  - model: {model_id}
+    backend: llamacpp
+"#
+        ))
+        .unwrap();
+        let client = RegistryClient::with_url(server.base_url()).unwrap();
+
+        let err = stage_registry_format(
+            &client,
+            &config.stages[0],
+            &macos_all_backends_selector_cfg(),
+        )
+        .unwrap_err();
+
+        assert!(
+            detail_mock.hits() > 0,
+            "explicit embedding backend validation must inspect registry task metadata"
+        );
+        assert!(
+            err.to_string()
+                .contains("does not support registry embedding model"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_load_resolves_backend_variant_format() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let detail_mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/models/test-llm");
+            then.status(200).header("content-type", "application/json").body(
+                r#"{"id":"test-llm","family":"test","task":"text-generation","parameters":1,"description":"d","default_variant":null,"variants":{"mlx-fp16":{"platform":"macos-arm64","format":"safetensors","quantization":"fp16","size_bytes":123,"hf_repo":"xybrid-ai/test-llm","file":"model.safetensors"}}}"#,
+            );
+        });
+        let resolve_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models/test-llm/resolve")
+                .query_param_exists("platform")
+                .query_param("format", "safetensors");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"mask":"test-llm","platform":"macos-arm64","resolved":{"hf_repo":"xybrid-ai/test-llm","file":"model.safetensors","download_url":"https://example.com/model.safetensors","format":"safetensors","quantization":"fp16","size_bytes":123,"sha256":""}}"#,
+                );
+        });
+
+        let yaml = format!(
+            r#"
+name: Backend Format
+registry: "{}"
+stages:
+  - id: llm
+    model: test-llm
+    target: device
+    backend: mlx
+"#,
+            server.base_url()
+        );
+
+        let ref_ = PipelineRef::from_yaml(&yaml).unwrap();
+        let pipeline =
+            Pipeline::from_ref_with_selector_cfg(&ref_, &apple_mlx_selector_cfg()).unwrap();
+
+        assert!(
+            detail_mock.hits() > 0,
+            "backend-stage resolution must inspect registry task metadata"
+        );
+        assert!(
+            resolve_mock.hits() > 0,
+            "backend-stage resolution must send the registry format query"
+        );
+        assert_eq!(pipeline.download_size(), 123);
+        assert_eq!(pipeline.stages()[0].status, StageStatus::NeedsDownload);
+        assert_eq!(pipeline.stages()[0].download_bytes, Some(123));
+    }
+
+    #[test]
+    fn pipeline_load_auto_resolves_mlx_variant_format_when_selector_prefers_it() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let detail_mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/models/test-llm");
+            then.status(200).header("content-type", "application/json").body(
+                r#"{"id":"test-llm","family":"test","task":"text-generation","parameters":1,"description":"d","default_variant":null,"variants":{"llamacpp-q4":{"platform":"macos-arm64","format":"gguf","quantization":"q4","size_bytes":456,"hf_repo":"xybrid-ai/test-llm","file":"model.gguf"},"mlx-fp16":{"platform":"macos-arm64","format":"safetensors","quantization":"fp16","size_bytes":123,"hf_repo":"xybrid-ai/test-llm","file":"model.safetensors"}}}"#,
+            );
+        });
+        let resolve_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models/test-llm/resolve")
+                .query_param_exists("platform")
+                .query_param("format", "safetensors");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"mask":"test-llm","platform":"macos-arm64","resolved":{"hf_repo":"xybrid-ai/test-llm","file":"model.safetensors","download_url":"https://example.com/model.safetensors","format":"safetensors","quantization":"fp16","size_bytes":123,"sha256":""}}"#,
+                );
+        });
+
+        let yaml = format!(
+            r#"
+name: Backend Auto Format
+registry: "{}"
+stages:
+  - id: llm
+    model: test-llm
+    target: device
+"#,
+            server.base_url()
+        );
+        let ref_ = PipelineRef::from_yaml(&yaml).unwrap();
+
+        let pipeline =
+            Pipeline::from_ref_with_selector_cfg(&ref_, &apple_mlx_selector_cfg()).unwrap();
+
+        assert!(
+            detail_mock.hits() > 0,
+            "auto stage resolution must inspect model variants before resolving"
+        );
+        assert!(
+            resolve_mock.hits() > 0,
+            "auto stage resolution must send the selector-chosen registry format"
+        );
+        assert_eq!(pipeline.download_size(), 123);
+        assert_eq!(pipeline.stages()[0].status, StageStatus::NeedsDownload);
+        assert_eq!(pipeline.stages()[0].download_bytes, Some(123));
+    }
+
+    #[cfg(feature = "llm-mlx")]
+    #[test]
+    fn streaming_metadata_accepts_mlx_safetensors_llm_when_runtime_available() {
+        let mut metadata = xybrid_core::execution::ModelMetadata::safetensors(
+            "qwen",
+            "1.0",
+            "model.safetensors",
+            "qwen3",
+        );
+        metadata.backend = Some("mlx".to_string());
+
+        assert!(is_streaming_mlx_metadata_with_cfg(
+            &metadata,
+            &apple_mlx_selector_cfg()
+        ));
+
+        let mut unavailable = apple_mlx_selector_cfg();
+        unavailable.mlx_runtime_ok = false;
+        assert!(!is_streaming_mlx_metadata_with_cfg(&metadata, &unavailable));
+    }
+
+    #[test]
+    fn streaming_metadata_requires_compiled_gguf_backend() {
+        let metadata = xybrid_core::execution::ModelMetadata {
+            model_id: "llama".to_string(),
+            version: "1.0".to_string(),
+            execution_template: xybrid_core::execution::ExecutionTemplate::Gguf {
+                model_file: "model.gguf".to_string(),
+                chat_template: None,
+                context_length: 4096,
+                generation_params: None,
+            },
+            preprocessing: Vec::new(),
+            postprocessing: Vec::new(),
+            files: vec!["model.gguf".to_string()],
+            description: None,
+            backend: None,
+            metadata: std::collections::HashMap::new(),
+            voices: None,
+            max_chunk_chars: None,
+            trim_trailing_samples: None,
+        };
+
+        assert_eq!(
+            is_streaming_llm_metadata(&metadata),
+            cfg!(any(feature = "llm-mistral", feature = "llm-llamacpp"))
+        );
+    }
+
+    #[test]
+    fn pipeline_input_type_infers_from_metadata() {
+        let mut asr = ModelMetadata::onnx("wav2vec2", "1.0", "model.onnx");
+        asr.preprocessing.push(PreprocessingStep::AudioDecode {
+            sample_rate: 16_000,
+            channels: 1,
+        });
+        assert_eq!(
+            pipeline_input_type_from_metadata(&asr),
+            PipelineInputType::Audio
+        );
+
+        let mut embedding =
+            ModelMetadata::safetensors("nomic", "1.0", "model.safetensors", "nomic_bert");
+        embedding
+            .metadata
+            .insert("task".to_string(), serde_json::json!("text-embedding"));
+        assert_eq!(
+            pipeline_input_type_from_metadata(&embedding),
+            PipelineInputType::Text
+        );
+
+        let llm = ModelMetadata::safetensors("qwen", "1.0", "model.safetensors", "qwen3");
+        assert_eq!(
+            pipeline_input_type_from_metadata(&llm),
+            PipelineInputType::Text
+        );
+
+        let mut vector = ModelMetadata::onnx("mnist", "1.0", "model.onnx");
+        vector.preprocessing.push(PreprocessingStep::Reshape {
+            shape: vec![1, 784],
+        });
+        assert_eq!(
+            pipeline_input_type_from_metadata(&vector),
+            PipelineInputType::Embedding
+        );
+    }
+
+    #[test]
+    fn pipeline_input_type_reads_loaded_first_stage_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata = ModelMetadata::safetensors("qwen", "1.0", "model.safetensors", "qwen3");
+        std::fs::write(
+            tmp.path().join("model_metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let stage_config = StageConfig::Simple("qwen".to_string());
+        let mut bundle_paths = HashMap::new();
+        bundle_paths.insert("llm".to_string(), tmp.path().to_path_buf());
+
+        let pipeline = Pipeline {
+            name: None,
+            handle: Arc::new(RwLock::new(PipelineHandle {
+                stage_descriptors: vec![StageDescriptor::new("llm")],
+                availability_map: HashMap::new(),
+                registry_url: None,
+                stage_configs: vec![stage_config],
+                bundle_paths,
+            })),
+            stages: vec![StageInfo {
+                id: "llm".to_string(),
+                model_id: Some("qwen".to_string()),
+                target: StageTarget::Device,
+                status: StageStatus::Cached,
+                download_bytes: None,
+                backend: Some("mlx".to_string()),
+            }],
+            total_download_bytes: 0,
+        };
+
+        assert_eq!(pipeline.input_type(), PipelineInputType::Text);
     }
 
     #[test]
@@ -1541,6 +2204,7 @@ stages:
             target: StageTarget::Device,
             status: StageStatus::Cached,
             download_bytes: None,
+            backend: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
